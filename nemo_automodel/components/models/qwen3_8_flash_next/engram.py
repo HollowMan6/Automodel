@@ -738,6 +738,8 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         self._validate_received_ids(received_ids, output_split_sizes)
         local_ids = received_ids - self.vocab_start_index
         local_weight = self.weight.to_local(grad_placements=self.weight.placements)
+        # Owner-sharded tables are excluded from FSDP's device moves.
+        local_weight = local_weight.to(device=local_ids.device, non_blocking=True)
         owned_values = F.embedding(local_ids, local_weight)
         returned_values = _FixedCapacityAllToAll.apply(
             owned_values,

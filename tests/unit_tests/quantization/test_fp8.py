@@ -455,3 +455,13 @@ class TestIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+def test_fp8_filter_preserves_adapter_descendants():
+    from nemo_automodel.components._peft.lora import patch_linear_module
+
+    layer = patch_linear_module(nn.Linear(16, 16), dim=16, use_triton=False)
+    assert not _module_filter_fn(layer, "projection")
+    assert not _module_filter_fn(layer.lora_A, "projection.lora_A")
+    assert not _module_filter_fn(layer.lora_B, "projection.lora_B")
+    assert _module_filter_fn(nn.Linear(16, 16), "projection")

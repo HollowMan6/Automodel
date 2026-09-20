@@ -14,6 +14,8 @@
 
 """Reuse the unchanged DeepSeek vision encoder with the V4.1 nested config."""
 
+from torch.distributed.device_mesh import DeviceMesh
+
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.vision import DeepseekV4VisionAligner, DeepseekV4VisionTransformer
 
@@ -48,6 +50,7 @@ class DeepseekV41VisionTransformer(DeepseekV4VisionTransformer):
 
     def __init__(self, config: DeepseekV41Config) -> None:
         super().__init__(_vision_config(config))
+        self._fsdp_mesh: DeviceMesh | None = None
 
 
 class DeepseekV41VisionAligner(DeepseekV4VisionAligner):

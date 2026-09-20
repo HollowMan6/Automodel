@@ -803,3 +803,38 @@ def test_memory_efficient_lora_declines_triton_on_mixed_dtype(x_dtype, lora_dtyp
             apply_memory_efficient_lora(x, lora_A, lora_B, 1.5, True)
 
     assert triton_forward.called is expect_triton
+
+
+@pytest.mark.parametrize("with_residual", [False, True])
+@pytest.mark.parametrize("adapter_dtype", [torch.float32, torch.bfloat16])
+def test_memory_efficient_lora_mixed_dtype_without_autocast(with_residual, adapter_dtype):
+    torch.manual_seed(13)
+    input_dtype = torch.bfloat16 if adapter_dtype == torch.float32 else torch.float32
+    x = torch.randn(2, 3, 8, dtype=input_dtype, requires_grad=True)
+    a = torch.randn(2, 8, dtype=adapter_dtype, requires_grad=True)
+    b = torch.randn(6, 2, dtype=adapter_dtype, requires_grad=True)
+    residual = torch.randn(2, 3, 6, dtype=input_dtype, requires_grad=True) if with_residual else None
+    refs = [t.detach().clone().requires_grad_() for t in (x, a, b)]
+    residual_ref = residual.detach().clone().requires_grad_() if with_residual else None
+    actual = apply_memory_efficient_lora(x, a, b, 0.5, False, residual)
+    expected = F.linear(F.linear(refs[0].to(adapter_dtype), refs[1]) * 0.5, refs[2])
+    if with_residual:
+        expected = expected + residual_ref
+    expected = expected.to(input_dtype)
+    gradient = torch.randn_like(expected)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch.testing.assert_close(actual, expected)
+    for tensor, ref in zip((x, a, b), refs):
+        torch.testing.assert_close(tensor.grad, ref.grad)
+    if with_residual:
+        torch.testing.assert_close(residual.grad, residual_ref.grad)
+
+
+def test_zero_lora_preserves_fp32_residual():
+    x = torch.ones(2, 3, 8)
+    a = torch.ones(2, 8, dtype=torch.bfloat16)
+    b = torch.zeros(6, 2, dtype=torch.bfloat16)
+    residual = torch.full((2, 3, 6), 1.001)
+    actual = apply_memory_efficient_lora(x, a, b, 1.0, False, residual)
+    torch.testing.assert_close(actual, residual, rtol=0, atol=0)

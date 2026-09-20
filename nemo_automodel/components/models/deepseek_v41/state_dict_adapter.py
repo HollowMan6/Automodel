@@ -197,7 +197,7 @@ def dequantize_checkpoint_weight(
             f"or local block coverage {expected_local}"
         )
     if local_scale.device != local_weight.device:
-        raise ValueError("Checkpoint weight and scale shards must reside on the same device")
+        local_scale = local_scale.to(local_weight.device)
     output = torch.empty((rows, columns), dtype=dtype, device=local_weight.device)
     if not local_weight.is_meta and rows and columns:
         column_ids = (torch.arange(columns, device=local_weight.device) + offsets[1]) // 32 - starts[1]

@@ -314,6 +314,9 @@ class LinearLoRA(nn.Linear):
                 bias = None
             res = tp_linear_forward(x, self.weight, bias, mm_for_2d_compile=False)
 
+        if hasattr(self, "lora_forward"):
+            return self.lora_forward(x, res)
+
         if not self.use_dora:
             if self.dropout_position == "pre":
                 x = F.dropout(x, p=self.dropout_p, training=self.training)
@@ -410,6 +413,9 @@ class TritonLinearLoRA(LinearLoRA):
             res = fwd(x)
         else:
             res = F.linear(x, self.weight, self.bias)
+
+        if hasattr(self, "lora_forward"):
+            return self.lora_forward(x, res)
 
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
@@ -512,6 +518,9 @@ def patch_linear_module(
     elif HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
         # Delegate base computation to TE's forward so TE kernels (including FP8)
         # are used instead of falling back to F.linear().
+        orig_linear.super_fwd = orig_linear.forward
+    elif type(orig_linear).forward is not nn.Linear.forward:
+        # Preserve custom base projections supplied by nn.Linear subclasses.
         orig_linear.super_fwd = orig_linear.forward
 
     orig_linear.__class__ = new_cls
@@ -831,23 +840,21 @@ def apply_memory_efficient_lora(x, lora_A, lora_B, scale, use_triton_kernel, res
         lora_A: Tensor of shape ``[rank, in_features]``.
         lora_B: Tensor of shape ``[out_features, rank]``.
         scale: LoRA scaling factor (``alpha / rank``).
-        use_triton_kernel: Request the Triton kernels; declined when their dtype precondition
-            does not hold (see below).
+        use_triton_kernel: Request the Triton kernels. Inputs are cast to the adapter dtype.
         res: Optional base-projection output to fold in, in ``x``'s leading shape with
             ``out_features`` trailing.
 
     Returns:
-        Tensor with ``x``'s leading dimensions and ``out_features`` trailing.
+        Tensor with ``x``'s leading dimensions and ``out_features`` trailing, in the
+        residual dtype when provided, otherwise the original input dtype.
     """
-    if use_triton_kernel and not (x.dtype == lora_A.dtype == lora_B.dtype):
-        # The Triton kernels hand their operands straight to ``tl.dot``, which asserts a single dtype
-        # ("Both operands must be same dtype. Got fp32 and bf16"), and they run outside autocast, so
-        # nothing reconciles the two. Mixed precision reaches here whenever an FSDP2 unit's
-        # ``output_dtype=float32`` hands an fp32 activation to bf16 adapters — the layout in #3652,
-        # whose recipe does set ``use_triton: true``. Drop to the torch matmul path below, which
-        # follows the forward compute dtype and casts explicitly.
+    if x.dtype != lora_A.dtype or x.dtype != lora_B.dtype:
         use_triton_kernel = False
-    out = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, use_triton_kernel, res)
+    output_dtype = res.dtype if res is not None else x.dtype
+    x = x.to(lora_A.dtype)
+    out = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, use_triton_kernel)
     if x.dim() == 3:
         out = out.reshape(*x.shape[:-1], -1)
-    return out
+    if res is not None:
+        out = out.to(torch.promote_types(out.dtype, res.dtype)).add_(res)
+    return out.to(output_dtype)

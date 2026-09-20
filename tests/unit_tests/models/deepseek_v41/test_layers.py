@@ -201,3 +201,41 @@ def test_te_norms_preserve_meta_storage_initialization_and_checkpoint_keys(dtype
 def test_unvalidated_norm_backends_are_rejected(rms_norm: str) -> None:
     with torch.device("meta"), pytest.raises(ValueError, match="torch_fp32 or te RMSNorm"):
         DeepseekV41ForCausalLM(_tiny_config(), backend=replace(_backend(), rms_norm=rms_norm))
+
+
+def test_grouped_lora_preserves_projection_and_gradients() -> None:
+    from nemo_automodel.components._peft.lora import patch_linear_module
+    from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4GroupedLinear
+
+    torch.manual_seed(19)
+    layer = DeepseekV4GroupedLinear(4, 6, 2).to(torch.bfloat16)
+    patch_linear_module(layer, dim=2, alpha=4, lora_dtype=torch.float32, use_triton=False)
+    with torch.no_grad():
+        layer.lora_B.weight.normal_()
+    x = torch.randn(3, 2, 4, dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_()
+    a_ref = layer.lora_A.weight.detach().clone().requires_grad_()
+    b_ref = layer.lora_B.weight.detach().clone().requires_grad_()
+    base = torch.stack(
+        [torch.nn.functional.linear(x_ref[:, group], layer.weight[group * 3 : (group + 1) * 3]) for group in range(2)],
+        dim=1,
+    )
+    delta = torch.stack(
+        [
+            torch.nn.functional.linear(
+                torch.nn.functional.linear(x_ref[:, group].float(), a_ref) * layer.scale,
+                b_ref[group * 3 : (group + 1) * 3],
+            )
+            for group in range(2)
+        ],
+        dim=1,
+    )
+    expected = base + delta.to(base.dtype)
+    actual = layer(x)
+    gradient = torch.randn_like(expected)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(layer.lora_A.weight.grad, a_ref.grad)
+    torch.testing.assert_close(layer.lora_B.weight.grad, b_ref.grad)
