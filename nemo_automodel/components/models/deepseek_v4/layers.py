@@ -299,6 +299,30 @@ class DeepseekV4GroupedLinear(nn.Linear):
         y = torch.bmm(x, w.transpose(-1, -2)).permute(1, 0, 2)
         return y.reshape(*batch_shape, self.n_groups, out_per_group)
 
+    def lora_forward(self, x: torch.Tensor, res: torch.Tensor) -> torch.Tensor:
+        """Apply adapters to the grouped projection after LoRA injection.
+
+        Args:
+            x: Tensor of shape [..., groups, in_features_per_group].
+            res: Base output of shape [..., groups, out_features_per_group].
+
+        Returns:
+            Tensor with the same shape and dtype as res; inputs are not mutated.
+        """
+        if getattr(self, "use_dora", False) and getattr(self, "lora_magnitude", None) is not None:
+            raise NotImplementedError("DoRA is not supported for grouped (block-diagonal) linears.")
+        if self.dropout_position == "pre" and self.training and self.dropout_p > 0.0:
+            x = F.dropout(x, p=self.dropout_p, training=self.training)
+
+        x = x.to(self.lora_A.weight.dtype)
+        a = F.linear(x.reshape(-1, self.n_groups, x.shape[-1]), self.lora_A.weight) * self.scale
+        b = self.lora_B.weight.view(self.n_groups, self.out_features // self.n_groups, -1)
+        delta = torch.bmm(a.transpose(0, 1), b.transpose(1, 2)).transpose(0, 1).reshape_as(res)
+
+        if self.dropout_position == "post":
+            delta = F.dropout(delta, p=self.dropout_p, training=self.training)
+        return res + delta.to(res.dtype)
+
 
 class DeepseekV4TrainCache:
     """Training-only cache shim mirroring the three methods ``DeepseekV4Compressor``

@@ -55,6 +55,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -279,7 +280,9 @@ class DeepseekV41Model(nn.Module):
 
         Returns:
             Tensor of shape [batch, sequence, hidden], retaining text and image
-            gradients. The supplied input tensors are not modified.
+            gradients. The supplied input tensors are not modified. FSDP ranks
+            with fewer images execute zero-contribution vision calls so both
+            forward and backward collectives remain aligned.
         """
         if self.vision is None:
             raise ValueError("pixel_values requires an enabled DeepSeek V4.1 vision encoder")
@@ -294,10 +297,32 @@ class DeepseekV41Model(nn.Module):
             downsample_ratio=self.vision_config.downsample_ratio,
         )
         embedded = self.embed_tokens(input_ids)
-        for item in images:
-            patches = item.patches.to(device=embedded.device, dtype=self.vision.patch_embed.proj.weight.dtype)
-            features = self.vision(patches, item.n_vit_h, item.n_vit_w)
-            features = self.aligner(features, item.n_vit_h, item.n_vit_w).to(embedded.dtype)
+        image_count = len(images)
+        if self.vision._fsdp_mesh is not None:
+            count = torch.tensor(image_count, device=embedded.device)
+            for mesh_dim in range(self.vision._fsdp_mesh.ndim):
+                dist.all_reduce(count, op=dist.ReduceOp.MAX, group=self.vision._fsdp_mesh.get_group(mesh_dim))
+            image_count = int(count.item())
+        for image_idx in range(image_count):
+            if image_idx < len(images):
+                item = images[image_idx]
+                n_h, n_w = item.n_vit_h, item.n_vit_w
+                patches = item.patches.to(device=embedded.device, dtype=self.vision.patch_embed.proj.weight.dtype)
+            else:
+                n_h = n_w = self.vision_config.downsample_ratio
+                patches = torch.zeros(
+                    n_h * n_w,
+                    3,
+                    self.vision_config.patch_size,
+                    self.vision_config.patch_size,
+                    device=embedded.device,
+                    dtype=self.vision.patch_embed.proj.weight.dtype,
+                )
+            features = self.vision(patches, n_h, n_w)
+            features = self.aligner(features, n_h, n_w).to(embedded.dtype)
+            if image_idx >= len(images):
+                embedded = embedded + features.sum() * 0
+                continue
             types = item.types.to(embedded.device)
             if (types == IMAGE).sum() != features.shape[0]:
                 raise ValueError("Image token count does not match the downsampled vision grid")
@@ -356,6 +381,14 @@ class DeepseekV41Model(nn.Module):
             image_mask = vision_token_types >= 0
         elif image_grid_hws is not None or (vision_token_types is not None and torch.any(vision_token_types >= 0)):
             raise ValueError("Image spans require pixel_values; image placeholders cannot be trained as ordinary text")
+        elif self.vision is not None and self.vision._fsdp_mesh is not None and inputs_embeds is None:
+            patch_size = self.vision_config.patch_size
+            inputs_embeds = self._image_embeddings(
+                input_ids,
+                torch.empty(0, 3, patch_size, patch_size, device=input_ids.device),
+                input_ids.new_empty((0, 2)),
+                torch.full_like(input_ids, -1),
+            )
         if position_ids is None:
             start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
             position_ids = (torch.arange(input_ids.shape[1], device=input_ids.device) + start).expand_as(input_ids)
@@ -558,14 +591,16 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         """Register owner table DTensors before FSDP records ignored parameters.
 
         Args:
-            fsdp_mesh: One-dimensional shard mesh whose ranks and ordering must
-                match the Engram owner group.
+            fsdp_mesh: FSDP mesh, flattened to the one-dimensional ``dp`` mesh
+                under HSDP. Its ranks and ordering must match the Engram owner group.
 
         Returns:
             Exact registered parameter identities to exclude from FSDP. Each
             has global shape [padded_rows, head_dim] and placement Shard(0);
             local storage has shape [padded_rows / owner_world_size, head_dim].
         """
+        if fsdp_mesh.ndim != 1:
+            fsdp_mesh = get_flat_mesh(fsdp_mesh, "dp")
         parameters: set[nn.Parameter] = set()
         for layer in self.model.layers.values():
             if layer.engram is None:

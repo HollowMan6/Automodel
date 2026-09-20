@@ -20,6 +20,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_sh
 
 from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 from nemo_automodel.components.models.deepseek_v4.vision import DeepseekV4VisionBlock, DeepseekV4VisionTransformer
+from nemo_automodel.components.models.deepseek_v41.vision import DeepseekV41VisionTransformer
 
 
 def fully_shard_deepseek_v41(
@@ -46,6 +47,8 @@ def fully_shard_deepseek_v41(
         The input module with FSDP applied.
     """
     wrapped = getattr(module, "_checkpoint_wrapped_module", module)
+    if isinstance(wrapped, DeepseekV41VisionTransformer):
+        wrapped._fsdp_mesh = mesh
     shard = (
         fully_shard_deepseek_v4
         if isinstance(wrapped, (DeepseekV4VisionTransformer, DeepseekV4VisionBlock))

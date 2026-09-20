@@ -53,6 +53,7 @@ MULTIMODAL_PROJECTOR_NAMES = (
     "vision_projector",
     "vit_large_projector",
     "audio_projector",
+    "aligner",
 )
 
 MULTIMODAL_MODULE_NAMES = MULTIMODAL_TOWER_NAMES + MULTIMODAL_PROJECTOR_NAMES

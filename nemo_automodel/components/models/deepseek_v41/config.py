@@ -431,6 +431,19 @@ class DeepseekV41Config(PretrainedConfig):
             **kwargs,
         )
 
+    @classmethod
+    def from_dict(
+        cls, config_dict: dict[str, Any], **kwargs: Any
+    ) -> "DeepseekV41Config | tuple[DeepseekV41Config, dict[str, Any]]":
+        """Apply the shared actor/rollout MTP override to the nested text config."""
+        if "num_nextn_predict_layers" in kwargs:
+            text_config = config_dict.get("text_config", {})
+            if isinstance(text_config, DeepseekV41TextConfig):
+                text_config = text_config.to_dict()
+            text_config = {**text_config, "num_nextn_predict_layers": kwargs.pop("num_nextn_predict_layers")}
+            config_dict = {**config_dict, "text_config": text_config}
+        return super().from_dict(config_dict, **kwargs)
+
     def build_tokenizer(self) -> PreTrainedTokenizerFast:
         """Load the checkpoint's fast tokenizer for deterministic Engram hashing.
 

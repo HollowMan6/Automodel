@@ -121,7 +121,7 @@ class _MLPBlock(nn.Module):
 
 _CASES = {
     # case -> (block factory, LoRA target modules, autograd function expected to run, peft.use_triton)
-    "per_linear": (lambda: _AttentionBlock(), ["*q_proj", "*o_proj"], "LoRATritonFunction", False),
+    "per_linear": (lambda: _AttentionBlock(), ["*q_proj", "*o_proj"], "apply_memory_efficient_lora", False),
     "fused_swiglu": (
         lambda: _MLPBlock("swiglu"),
         ["*gate_proj", "*up_proj", "*down_proj"],
@@ -139,14 +139,14 @@ _CASES = {
 
 @contextlib.contextmanager
 def _observe_lora_dtypes():
-    """Record ``(activation dtype, weight dtype)`` per memory-efficient LoRA autograd function.
+    """Record dtypes at the LoRA entry point, before input dtype normalization.
 
     Without this the cases could pass on a uniform-dtype graph -- i.e. never exercise the bug --
     and still look green.
     """
     observed: dict[str, set] = {}
     originals = {
-        "LoRATritonFunction": lora_module.LoRATritonFunction.forward,
+        "apply_memory_efficient_lora": lora_module.apply_memory_efficient_lora,
         "LoRASwiGLUMLPFunction": lora_mlp_module.LoRASwiGLUMLPFunction.forward,
         "LoRAReLU2MLPFunction": lora_mlp_module.LoRAReLU2MLPFunction.forward,
     }
@@ -162,9 +162,22 @@ def _observe_lora_dtypes():
         """
         observed.setdefault(name, set()).add((x.dtype, weight.dtype))
 
-    def per_linear(x, lora_A, lora_B, scale, dtype, use_triton_kernel=True, res=None):
-        record("LoRATritonFunction", x, lora_A)
-        return originals["LoRATritonFunction"](x, lora_A, lora_B, scale, dtype, use_triton_kernel, res)
+    def per_linear(x, lora_A, lora_B, scale, use_triton_kernel, res=None):
+        """Observe a projection before its adapter input cast.
+
+        Args:
+            x: Activations of shape [tokens, hidden] or [batch, sequence, hidden].
+            lora_A: Adapter weight of shape [rank, hidden].
+            lora_B: Adapter weight of shape [output, rank].
+            scale: Adapter scale.
+            use_triton_kernel: Whether to request Triton execution.
+            res: Optional base output with x's leading shape and output features.
+
+        Returns:
+            Projection with x's leading shape and output features.
+        """
+        record("apply_memory_efficient_lora", x, lora_A)
+        return originals["apply_memory_efficient_lora"](x, lora_A, lora_B, scale, use_triton_kernel, res)
 
     def swiglu(ctx, x, gW, *rest):
         record("LoRASwiGLUMLPFunction", x, gW)
@@ -174,15 +187,17 @@ def _observe_lora_dtypes():
         record("LoRAReLU2MLPFunction", x, uW)
         return originals["LoRAReLU2MLPFunction"](ctx, x, uW, *rest)
 
-    lora_module.LoRATritonFunction.forward = staticmethod(per_linear)
+    lora_module.apply_memory_efficient_lora = per_linear
     lora_mlp_module.LoRASwiGLUMLPFunction.forward = staticmethod(swiglu)
     lora_mlp_module.LoRAReLU2MLPFunction.forward = staticmethod(relu2)
     try:
         yield observed
     finally:
         for name, fn in originals.items():
-            owner = lora_module if name == "LoRATritonFunction" else lora_mlp_module
-            getattr(owner, name).forward = staticmethod(fn)
+            if name == "apply_memory_efficient_lora":
+                lora_module.apply_memory_efficient_lora = fn
+            else:
+                getattr(lora_mlp_module, name).forward = staticmethod(fn)
 
 
 def _build_sharded_block(case: str, memory_efficient: bool, mesh, device, reference_state=None):

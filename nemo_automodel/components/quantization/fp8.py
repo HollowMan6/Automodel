@@ -113,6 +113,10 @@ def _module_filter_fn(module, name, filter_fqns: List[str] = None):
         if fqn in name:
             return False
 
+    # FP8 conversion would discard the patched parent or its trainable adapters.
+    if hasattr(module, "lora_A") or any(part in {"lora_A", "lora_B"} for part in name.split(".")):
+        return False
+
     # Always skip non-linear layers
     if not isinstance(module, nn.Linear):
         return False

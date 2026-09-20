@@ -1066,8 +1066,10 @@ class GroupedExpertsDeepEP(nn.Module):
         # the (typically bf16) activations. When the weights are already in the
         # activation dtype these casts are no-ops.
         compute_dtype = permuted_local_hidden_states.dtype
-        gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
-        down_projs = self.down_projs.to_local().to(compute_dtype)
+        # CPU-offloaded expert weights must follow the dispatched activations.
+        compute_device = permuted_local_hidden_states.device
+        gate_and_up_projs = self.gate_and_up_projs.to_local().to(device=compute_device, dtype=compute_dtype)
+        down_projs = self.down_projs.to_local().to(device=compute_device, dtype=compute_dtype)
 
         # With static routing (forced balance, no noise) every expert receives tokens by
         # construction, so the count_nonzero device-to-host read (one per microbatch, and

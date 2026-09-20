@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real two-rank regressions for frozen multimodal FSDP policies."""
+"""Real two-rank regressions for frozen parameters and uneven multimodal FSDP execution."""
 
 import argparse
+import copy
+import datetime
 import os
 import subprocess
 import sys
@@ -23,9 +25,10 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.fsdp._fully_shard import FSDPModule
 from torch.distributed.tensor import DTensor
 
@@ -222,6 +225,149 @@ def test_frozen_multimodal_fsdp_two_rank_regressions() -> None:
     print(completed.stdout)
     assert completed.returncode == 0, completed.stdout
     assert _RESULT_PREFIX + "PASS" in completed.stdout
+
+
+def _dsv41_uneven_vision_worker(
+    rank: int,
+    rendezvous: str,
+    image_counts: tuple[int, int],
+    checkpointing: bool,
+) -> None:
+    """Compare uneven-image FSDP outputs, gradients and an SGD step with the reference."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.deepseek_v41.config import (
+        DeepseekV41Config,
+        DeepseekV41TextConfig,
+        DeepseekV41VisionConfig,
+    )
+    from nemo_automodel.components.models.deepseek_v41.fsdp import fully_shard_deepseek_v41
+    from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    torch.manual_seed(17)
+    config = DeepseekV41Config(
+        text_config=DeepseekV41TextConfig(
+            vocab_size=32,
+            hidden_size=8,
+            num_hidden_layers=1,
+            engram_layer_ids=[],
+            dtype="float32",
+            moe_intermediate_size=8,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=4,
+            o_lora_rank=4,
+            o_groups=1,
+            hc_mult=2,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            compress_ratios=[0],
+            kv_source_layer_ids=[],
+            index_source_layer_ids=[],
+            candidate_source_layer_id=-1,
+            num_nextn_predict_layers=0,
+            dspark_block_size=0,
+            dspark_noise_token_id=0,
+        ),
+        vision_config=DeepseekV41VisionConfig(
+            num_hidden_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            intermediate_size=12,
+            patch_size=2,
+            downsample_ratio=2,
+        ),
+        image_token_id=1,
+        dtype="float32",
+    )
+    reference = DeepseekV41ForCausalLM(
+        config,
+        backend=BackendConfig(
+            attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="torch"
+        ),
+    ).to(device)
+    reference.initialize_weights(device, dtype=torch.float32)
+    # Delimiters are frozen for LoRA, just as in the RL recipe.
+    for name in ("image_start", "image_end", "image_newline"):
+        getattr(reference.model, name).requires_grad_(False)
+    distributed = copy.deepcopy(reference)
+    if checkpointing:
+        for i, block in enumerate(distributed.model.vision.blocks):
+            distributed.model.vision.blocks[i] = checkpoint_wrapper(block)
+    count = image_counts[rank]
+    ids = torch.tensor([[2] + [1] * (4 * count) + [3]], device=device)
+    types = torch.tensor([[-1] + [0, 1, 2, 3] * count + [-1]], device=device)
+    pixels = torch.linspace(-1, 1, max(1, count * 4 * 3 * 2 * 2), device=device)
+    pixels = pixels[: count * 48].reshape(count * 4, 3, 2, 2)
+    grids = torch.tensor([[2, 2]] * count, device=device, dtype=torch.long).reshape(count, 2)
+    model_inputs = {"input_ids": ids}
+    if count:
+        model_inputs.update(pixel_values=pixels, image_grid_hws=grids, vision_token_types=types)
+    expected = reference(**model_inputs).logits
+    expected.square().sum().backward()
+
+    dist.init_process_group(
+        "nccl",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=60),
+    )
+    try:
+        mesh = init_device_mesh("cuda", (2,))
+        policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+        fully_shard_deepseek_v41(distributed.model.vision, mesh=mesh, mp_policy=policy)
+        fully_shard(distributed.model.aligner, mesh=mesh, mp_policy=policy)
+        fully_shard(distributed.model, mesh=mesh, mp_policy=policy)
+        fully_shard(distributed, mesh=mesh, mp_policy=policy)
+        optimizer = torch.optim.SGD(distributed.parameters(), lr=0.01)
+        with torch.no_grad():
+            torch.testing.assert_close(distributed(**model_inputs).logits, expected.detach(), rtol=1e-5, atol=1e-5)
+        actual = distributed(**model_inputs).logits
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        actual.square().sum().backward()
+        ref_params = dict(reference.named_parameters())
+        expected_parameters = {}
+        for name, parameter in distributed.named_parameters():
+            if not name.startswith(("model.vision.", "model.aligner.")):
+                continue
+            ref_name = name.replace("._checkpoint_wrapped_module", "")
+            wanted = ref_params[ref_name].grad
+            wanted = torch.zeros_like(ref_params[ref_name]) if wanted is None else wanted.clone()
+            dist.all_reduce(wanted)
+            wanted /= 2
+            assert parameter.grad is not None, name
+            actual_grad = parameter.grad.full_tensor() if isinstance(parameter.grad, DTensor) else parameter.grad
+            torch.testing.assert_close(actual_grad, wanted, rtol=1e-4, atol=1e-5, msg=name)
+            expected_parameters[name] = ref_params[ref_name].detach() - 0.01 * wanted
+        optimizer.step()
+        for name, parameter in distributed.named_parameters():
+            if name in expected_parameters:
+                actual_parameter = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
+                torch.testing.assert_close(actual_parameter, expected_parameters[name], rtol=1e-4, atol=1e-5, msg=name)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.gpu
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("image_counts,checkpointing", [((2, 0), False), ((2, 1), True)])
+def test_uneven_vision_fsdp_matches_unsharded_forward_and_gradients(
+    tmp_path: Path, image_counts: tuple[int, int], checkpointing: bool
+) -> None:
+    """A rank with no images must participate in the same vision collectives."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("This FSDP regression test requires two CUDA devices")
+    mp.spawn(
+        _dsv41_uneven_vision_worker,
+        args=(str(tmp_path / "rendezvous"), image_counts, checkpointing),
+        nprocs=2,
+        join=True,
+    )
 
 
 def _parse_args() -> argparse.Namespace:
