@@ -102,6 +102,7 @@ class CheckpointingConfig:
     model_cache_dir: str | Path | None = None
     model_repo_id: str | None = None
     save_consolidated: bool | str | SaveConsolidatedMode = "final"
+    save_optimizer: bool = True
     is_peft: bool = False
     model_state_dict_keys: list[str] | None = (
         None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
